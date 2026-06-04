@@ -3,9 +3,37 @@ find 4 chunks generating desert wells at the corner that intersect with each oth
 They need to be directly at corners, one block off.
 
 Note: operations refer to the amount of relative operations to seed/chunk candidates.
+Note: random refers to an arbitrary mt19937 random, don't really matter.
 
 Brute forcing would take too many ops. With 2^32 seeds, and a chance of 1 in 128000 in each chunk (raised to power of 4) makes it impossible to brute force. (around 180 years on a normal computer)
 
+Looking at the code: (refernce in well.h)
+For every chunk: (seed, cx, cz) (seed is only last 32 bits, and anything that overflows mods 2^32)
+   Get featureseed with random (universal world seed hash of xMul and zMul)
+   Get baseseed ((cx*xMul)+(cz*zMul))^seed
+   Get regionseed uint32_t(base ^ (seed.featureKey + (base << 6) + (base >> 2) - 1640531527))
+   Extract values using random with regionseed as key:
+        Generates: first nextInt mod 500 == 0
+        Offx and Offy: second and third nextint values denoting the position in a chunk.
+
 General optimizations: Note that each layer of computing, there are at most 2^32 seeds. This is easily iteratable.
 
+First, we can find all the important baseseeds by iterating through 2^32 of them and see if they generate a well in a corner. There's around 35000 of each.
 
+The next part is a bit tricky:
+For each seed, we can isolate the part ((cx*xMul)+(cz*zMul)) to get the base seed.
+Note that a 2 by 2 generate with this part being:
+    Let ox and oz be the origin chunks, multiplied with multipliers.
+    Let O be ox+oz
+    The 4 chunks's are O, O+xMul, O+zMul, and O+xMul+zMul
+    These must all match some valid corner base^seed value for their corner
+
+Instead of just searching all regions, we extract xMul and zMul for the specific seed.
+
+This turns into a different problem that can be solved much quicker.
+Let a1, a2, a3, a4 be the valid base seeds, corresponding with O, O+xMul, O+zMul, and O+xMul+zMul all ^ seed
+
+For each seed, we find the multipliers. We then use an array a1, iterating through every element, and seeing if the other arrays have the matching values needed.
+This can be done in just ~35000 operations (maybe with a minor log factor due to memory constraints). This is extremely efficient, scanning the entire 2^32 by 2^32 world in just 35000 ops, which would have been 2^64 ops.
+
+Then we loop through all seeds and find a valid seed. There are likely many seeds, take the closest quad well to (0,0) as the final result.
