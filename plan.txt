@@ -1,0 +1,11 @@
+Seedfinding task: 
+find 4 chunks generating desert wells at the corner that intersect with each other
+They need to be directly at corners, one block off.
+
+Note: operations refer to the amount of relative operations to seed/chunk candidates.
+
+Brute forcing would take too many ops. With 2^32 seeds, and a chance of 1 in 128000 in each chunk (raised to power of 4) makes it impossible to brute force. (around 180 years on a normal computer)
+
+General optimizations: Note that each layer of computing, there are at most 2^32 seeds. This is easily iteratable.
+
+
