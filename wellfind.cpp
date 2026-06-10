@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <numeric>
 
 using namespace std;
 using namespace std::chrono;
@@ -26,7 +27,7 @@ enum Corner : int {
 };
 
 static constexpr uint64_t TOTAL_UINT32 = 0x1'0000'0000ULL;
-static constexpr uint32_t REPORT_INTERVAL_SECONDS = 1;
+static constexpr uint32_t REPORT_INTERVAL_SECONDS = 20;
 static constexpr uint64_t FLUSH_INTERVAL = 1ull << 16;
 static constexpr int LOWER_BITS = 20;
 static constexpr uint32_t LOWER_SIZE = 1u << LOWER_BITS;
@@ -95,6 +96,38 @@ inline void printProgress(const string &phaseName, uint64_t processed, uint64_t 
     cerr << '\n';
 }
 
+inline uint64_t chebyshevDistance(int32_t x, int32_t z) noexcept {
+    uint64_t ax = uint64_t(llabs(x));
+    uint64_t az = uint64_t(llabs(z));
+    return max(ax, az);
+}
+
+bool solveLinearDiophantine(int64_t a, int64_t b, int64_t c,
+                            int64_t &x0, int64_t &y0, int64_t &g) {
+    auto extgcd = [&](auto self, int64_t aa, int64_t bb) -> pair<int64_t, int64_t> {
+        if (bb == 0) return {1, 0};
+
+        auto p = self(self, bb, aa % bb);
+
+        __int128 x = p.second;
+        __int128 y = (__int128)p.first - (__int128)(aa / bb) * p.second;
+        return { (int64_t)x, (int64_t)y };
+    };
+
+    g = std::gcd(a, b);
+    if (g < 0) g = -g;
+    if (g == 0) return c == 0;
+
+    if (c % g != 0) return false;
+
+    auto uv = extgcd(extgcd, a, b);
+
+    __int128 scale = (__int128)c / g;
+    x0 = (int64_t)((__int128)uv.first * scale);
+    y0 = (int64_t)((__int128)uv.second * scale);
+    return true;
+}
+
 struct BestSolution {
     uint32_t seed;
     uint32_t xMul;
@@ -102,62 +135,98 @@ struct BestSolution {
     uint32_t baseO;
     int32_t chunkX;
     int32_t chunkZ;
-    uint64_t distanceSquared;
+    uint64_t distance; // exact min max(|x|, |z|)
 };
 
-inline uint64_t squaredDistance(int32_t x, int32_t z) noexcept {
-    int64_t xx = int64_t(x);
-    int64_t zz = int64_t(z);
-    return uint64_t(xx * xx + zz * zz);
+static inline __int128 iabs128(__int128 v) noexcept {
+    return v < 0 ? -v : v;
 }
 
-bool solveLinearDiophantine(int64_t a, int64_t b, int64_t c, int64_t &x0, int64_t &y0, int64_t &g) {
-    auto extgcd = [&](auto self, int64_t aa, int64_t bb) -> pair<int64_t, int64_t> {
-        if (bb == 0) return {1, 0};
-        auto p = self(self, bb, aa % bb);
-        return pair{p.second, p.first - (aa / bb) * p.second};
-    };
-    auto uv = extgcd(extgcd, a, b);
-    g = a * uv.first + b * uv.second;
-    if (g < 0) {
-        g = -g;
-        uv.first = -uv.first;
-        uv.second = -uv.second;
-    }
-    if (c % g != 0) return false;
-    x0 = uv.first * (c / g);
-    y0 = uv.second * (c / g);
-    return true;
+static inline __int128 floorDiv128(__int128 a, __int128 b) noexcept {
+    // b > 0
+    __int128 q = a / b;
+    __int128 r = a % b;
+    if (r != 0 && a < 0) --q;
+    return q;
+}
+
+static inline __int128 ceilDiv128(__int128 a, __int128 b) noexcept {
+    // b > 0
+    __int128 q = a / b;
+    __int128 r = a % b;
+    if (r != 0 && a > 0) ++q;
+    return q;
 }
 
 BestSolution nearestSolution(uint32_t seed, uint32_t xMul, uint32_t zMul, uint32_t baseO) {
     int64_t cx0 = 0;
     int64_t cz0 = 0;
     int64_t g = 0;
+
     if (!solveLinearDiophantine(int64_t(xMul), int64_t(zMul), int64_t(int32_t(baseO)), cx0, cz0, g)) {
         return BestSolution{seed, xMul, zMul, baseO, 0, 0, UINT64_MAX};
     }
+    if (g <= 0) {
+        return BestSolution{seed, xMul, zMul, baseO, 0, 0, UINT64_MAX};
+    }
+
     int64_t stepX = int64_t(zMul) / g;
     int64_t stepZ = int64_t(xMul) / g;
-    long double ideal = -static_cast<long double>(cx0) / static_cast<long double>(stepX);
-    int64_t bestK = llround(ideal);
-    int64_t bestCx = cx0 + bestK * stepX;
-    int64_t bestCz = cz0 - bestK * stepZ;
-    uint64_t bestDistance = squaredDistance(int32_t(bestCx), int32_t(bestCz));
-    for (int delta = -2; delta <= 2; ++delta) {
-        int64_t candidateK = bestK + delta;
-        int64_t candidateCx = cx0 + candidateK * stepX;
-        int64_t candidateCz = cz0 - candidateK * stepZ;
-        uint64_t candidateDistance = squaredDistance(int32_t(candidateCx), int32_t(candidateCz));
-        if (candidateDistance < bestDistance) {
-            bestDistance = candidateDistance;
-            bestCx = candidateCx;
-            bestCz = candidateCz;
+
+    __int128 ax0 = cx0;
+    __int128 az0 = cz0;
+    __int128 sx = stepX;
+    __int128 sz = stepZ;
+
+    auto feasible = [&](uint64_t D, __int128 &loK, __int128 &hiK) -> bool {
+        __int128 d = (__int128)D;
+
+        // x = cx0 + k*stepX
+        __int128 lo1 = ceilDiv128(-d - ax0, sx);
+        __int128 hi1 = floorDiv128( d - ax0, sx);
+
+        // z = cz0 - k*stepZ
+        __int128 lo2 = ceilDiv128(az0 - d, sz);
+        __int128 hi2 = floorDiv128(az0 + d, sz);
+
+        loK = max(lo1, lo2);
+        hiK = min(hi1, hi2);
+        return loK <= hiK;
+    };
+
+    uint64_t upper = uint64_t(max(iabs128(ax0), iabs128(az0)));
+    uint64_t lo = 0, hi = upper;
+
+    while (lo < hi) {
+        uint64_t mid = lo + ((hi - lo) >> 1);
+        __int128 kLo = 0, kHi = 0;
+        if (feasible(mid, kLo, kHi)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
         }
     }
-    return BestSolution{seed, xMul, zMul, baseO, int32_t(bestCx), int32_t(bestCz), bestDistance};
-}
 
+    __int128 kLo = 0, kHi = 0;
+    if (!feasible(lo, kLo, kHi)) {
+        return BestSolution{seed, xMul, zMul, baseO, 0, 0, UINT64_MAX};
+    }
+
+    // Any k in [kLo, kHi] is optimal now.
+    __int128 k = kLo;
+    __int128 bestCx = ax0 + k * sx;
+    __int128 bestCz = az0 - k * sz;
+
+    return BestSolution{
+        seed,
+        xMul,
+        zMul,
+        baseO,
+        int32_t(bestCx),
+        int32_t(bestCz),
+        lo
+    };
+}
 struct PhaseStatus {
     string name;
     uint64_t total;
@@ -202,13 +271,16 @@ static inline uint32_t low20(uint32_t v) noexcept {
     return v & LOWER_MASK;
 }
 
+array<vector<uint32_t>, CORNER_COUNT> cornerSets;
+array<BucketTable, CORNER_COUNT> tables;
+
 int main(int argc, char **argv) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
 
     unsigned threadCount = thread::hardware_concurrency();
     if (threadCount == 0) threadCount = 1;
-    uint64_t limitTotal = 1ull << 22;
+    uint64_t limitTotal = 1ull << 32;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -296,9 +368,6 @@ int main(int argc, char **argv) {
     if (baseReporter.joinable()) baseReporter.join();
     cerr << "base phase complete\n";
 
-    array<vector<uint32_t>, CORNER_COUNT> cornerSets;
-    array<BucketTable, CORNER_COUNT> tables;
-
     for (int corner = 0; corner < CORNER_COUNT; ++corner) {
         auto &list = validBases[corner];
         sort(list.begin(), list.end());
@@ -383,8 +452,6 @@ int main(int argc, char **argv) {
             auto fromSELow = [&](uint32_t baseSELow, uint32_t deltaLow) -> uint32_t {
                 return (seedLow ^ ((seedLow ^ baseSELow) + deltaLow)) & LOWER_MASK;
             };
-
-            bool anyFoundLow = false;
             for (uint32_t k : iterKeys) {
                 uint32_t candidateSE_low = toSELow(iterCorner, k);
                 uint32_t swLow = fromSELow(candidateSE_low, xLo);
@@ -400,33 +467,31 @@ int main(int argc, char **argv) {
                 uint32_t e = b + seTbl.count[candidateSE_low];
 
                 for (uint32_t idx = b; idx < e; ++idx) {
-                    uint32_t baseSE = seTbl.values[idx];
-                    uint32_t cSE = seed ^ baseSE;
+    			if ((idx & 1023u) == 0u && stopRequested.load(memory_order_relaxed)) {
+        			break;
+    			}
 
-                    uint32_t baseSW = seed ^ (cSE + xMul);
-                    uint32_t baseNE = seed ^ (cSE + zMul);
-                    uint32_t baseNW = seed ^ (cSE + xMul + zMul);
+    			uint32_t baseSE = seTbl.values[idx];
+   			uint32_t cSE = seed ^ baseSE;
 
-                    if (!swTbl.contains(baseSW)) continue;
-                    if (!neTbl.contains(baseNE)) continue;
-                    if (!nwTbl.contains(baseNW)) continue;
+    			uint32_t baseSW = seed ^ (cSE + xMul);
+    			uint32_t baseNE = seed ^ (cSE + zMul);
+    			uint32_t baseNW = seed ^ (cSE + xMul + zMul);
 
-                    anyFoundLow = true;
-                    candidateCount.fetch_add(1, memory_order_relaxed);
-                    foundCount.fetch_add(1, memory_order_relaxed);
+    			if (!swTbl.contains(baseSW)) continue;
+    			if (!neTbl.contains(baseNE)) continue;
+    			if (!nwTbl.contains(baseNW)) continue;
 
-                    uint32_t baseO = cSE;
-                    BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
-                    if (solution.distanceSquared < localBest.distanceSquared) {
-                        localBest = solution;
-                    }
-                    break;
-                }
+    			candidateCount.fetch_add(1, memory_order_relaxed);
+    			foundCount.fetch_add(1, memory_order_relaxed);
 
-                if (localBest.distanceSquared < UINT64_MAX) break;
+    			uint32_t baseO = cSE;
+    			BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
+    			if (solution.distance < localBest.distance) {
+        			localBest = solution;
+    			}
+		}
             }
-
-            (void)anyFoundLow;
             ++localProcessed;
             if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
                 searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
@@ -435,9 +500,9 @@ int main(int argc, char **argv) {
         }
 
         searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
-        if (localBest.distanceSquared < UINT64_MAX) {
+        if (localBest.distance < UINT64_MAX) {
             lock_guard<mutex> guard(bestMutex);
-            if (localBest.distanceSquared < best.distanceSquared) {
+            if (localBest.distance < best.distance) {
                 best = localBest;
             }
         }
@@ -453,12 +518,12 @@ int main(int argc, char **argv) {
     stopRequested.store(true, memory_order_relaxed);
     if (searchReporter.joinable()) searchReporter.join();
 
-    if (best.distanceSquared < UINT64_MAX) {
+    if (best.distance < UINT64_MAX) {
         cerr << "FOUND seed=" << best.seed
              << " xMul=" << best.xMul
              << " zMul=" << best.zMul
              << " originChunk=(" << best.chunkX << ',' << best.chunkZ << ')'
-             << " distance^2=" << best.distanceSquared << '\n';
+             << " distance=" << best.distance << '\n';
     } else {
         cerr << "No valid solution found in scanned range.\n";
     }
