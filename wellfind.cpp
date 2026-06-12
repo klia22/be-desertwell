@@ -1,5 +1,5 @@
 #include <bits/stdc++.h>
-#include "well.h"
+#include "well.h" //Used only for RNG
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 #include <numeric>
+#include <immintrin.h>
+#include <memory>
 
 using namespace std;
 using namespace std::chrono;
@@ -28,18 +30,18 @@ enum Corner : int {
 
 static constexpr uint64_t TOTAL_UINT32 = 0x1'0000'0000ULL;
 static constexpr uint32_t REPORT_INTERVAL_SECONDS = 20;
-static constexpr uint64_t FLUSH_INTERVAL = 1ull << 10;
+static constexpr uint64_t FLUSH_INTERVAL = 20;
 
-// Exact low24 filtering
-static constexpr int LOWER_BITS = 24;
+// Exact low22 filtering
+static constexpr int LOWER_BITS = 22;
 static constexpr uint32_t LOWER_SIZE = 1u << LOWER_BITS;
 static constexpr uint32_t LOWER_MASK = LOWER_SIZE - 1u;
 
-// MITM split for the low24 layer: 14 high bits + 10 low bits
+// MITM split for the low22 layer: 12 high bits + 10 low bits
 static constexpr int MITM_LOW_BITS = 10;
-static constexpr int MITM_HIGH_BITS = LOWER_BITS - MITM_LOW_BITS; // 14
+static constexpr int MITM_HIGH_BITS = LOWER_BITS - MITM_LOW_BITS; // 12
 static constexpr uint32_t MITM_LOW_SIZE = 1u << MITM_LOW_BITS;    // 1024
-static constexpr uint32_t MITM_HIGH_SIZE = 1u << MITM_HIGH_BITS;  // 16384
+static constexpr uint32_t MITM_HIGH_SIZE = 1u << MITM_HIGH_BITS;  // 4096
 static constexpr uint32_t MITM_LOW_MASK = MITM_LOW_SIZE - 1u;
 static constexpr uint32_t MITM_HIGH_MASK = MITM_HIGH_SIZE - 1u;
 
@@ -51,6 +53,7 @@ inline uint32_t computeRegionSeedFromBase(uint32_t base) noexcept {
     return base ^ (DW::FEATURE_KEY + (base << 6) + (base >> 2) - 1640531527u);
 }
 
+// Fast MT19937
 static constexpr uint32_t MT_A = 1812433253u;
 static constexpr uint32_t TWIST_B = 0x9908b0dfu;
 
@@ -90,7 +93,7 @@ inline DW::FeatureSeed fastMakeFeatureSeed(uint32_t seedLow32) noexcept {
         (raw0 >> 1) | 1u,
         (raw1 >> 1) | 1u,
         DW::FEATURE_KEY
-    }; // xMul and zMul: upper 31 bits random, last bit is 1 (always odd)
+    };
 }
 
 inline void printProgress(const string &phaseName, uint64_t processed, uint64_t total, double rate) {
@@ -110,9 +113,7 @@ bool solveLinearDiophantine(int64_t a, int64_t b, int64_t c,
                             int64_t &x0, int64_t &y0, int64_t &g) {
     auto extgcd = [&](auto self, int64_t aa, int64_t bb) -> pair<int64_t, int64_t> {
         if (bb == 0) return {1, 0};
-
         auto p = self(self, bb, aa % bb);
-
         __int128 x = p.second;
         __int128 y = (__int128)p.first - (__int128)(aa / bb) * p.second;
         return { (int64_t)x, (int64_t)y };
@@ -121,11 +122,9 @@ bool solveLinearDiophantine(int64_t a, int64_t b, int64_t c,
     g = std::gcd(a, b);
     if (g < 0) g = -g;
     if (g == 0) return c == 0;
-
     if (c % g != 0) return false;
 
     auto uv = extgcd(extgcd, a, b);
-
     __int128 scale = (__int128)c / g;
     x0 = (int64_t)((__int128)uv.first * scale);
     y0 = (int64_t)((__int128)uv.second * scale);
@@ -182,13 +181,10 @@ BestSolution nearestSolution(uint32_t seed, uint32_t xMul, uint32_t zMul, uint32
 
     auto feasible = [&](uint64_t D, __int128 &loK, __int128 &hiK) -> bool {
         __int128 d = (__int128)D;
-
         __int128 lo1 = ceilDiv128(-d - ax0, sx);
         __int128 hi1 = floorDiv128(d - ax0, sx);
-
         __int128 lo2 = ceilDiv128(az0 - d, sz);
         __int128 hi2 = floorDiv128(az0 + d, sz);
-
         loK = max(lo1, lo2);
         hiK = min(hi1, hi2);
         return loK <= hiK;
@@ -217,13 +213,7 @@ BestSolution nearestSolution(uint32_t seed, uint32_t xMul, uint32_t zMul, uint32
     __int128 bestCz = az0 - k * sz;
 
     return BestSolution{
-        seed,
-        xMul,
-        zMul,
-        baseO,
-        int32_t(bestCx),
-        int32_t(bestCz),
-        lo
+        seed, xMul, zMul, baseO, int32_t(bestCx), int32_t(bestCz), lo
     };
 }
 
@@ -255,88 +245,135 @@ void reporterThread(const PhaseStatus &status) {
     printProgress(status.name, current, status.total, 0.0);
 }
 
+//SIMD optimization
 struct alignas(64) RowMask1024 {
     uint64_t w[16]{};
 };
 
+struct ShiftParams {
+    unsigned wordShift;
+    unsigned bitShift;
+    unsigned bitShift2;
+};
+
 static inline bool anyMask(const RowMask1024 &m) noexcept {
-    for (uint64_t v : m.w) {
-        if (v) return true;
+    const __m256i* v = (const __m256i*)m.w;
+    __m256i o01 = _mm256_or_si256(v[0], v[1]);
+    __m256i o23 = _mm256_or_si256(v[2], v[3]);
+    __m256i final_or = _mm256_or_si256(o01, o23);
+    return !_mm256_testz_si256(final_or, final_or);
+}
+
+static inline void andMask2(RowMask1024 &a, const RowMask1024 &b) noexcept {
+    __m256i* va = (__m256i*)a.w;
+    const __m256i* vb = (const __m256i*)b.w;
+    va[0] = _mm256_and_si256(va[0], vb[0]);
+    va[1] = _mm256_and_si256(va[1], vb[1]);
+    va[2] = _mm256_and_si256(va[2], vb[2]);
+    va[3] = _mm256_and_si256(va[3], vb[3]);
+}
+
+static inline void orMask2(RowMask1024 &a, const RowMask1024 &b) noexcept {
+    __m256i* va = (__m256i*)a.w;
+    const __m256i* vb = (const __m256i*)b.w;
+    va[0] = _mm256_or_si256(va[0], vb[0]);
+    va[1] = _mm256_or_si256(va[1], vb[1]);
+    va[2] = _mm256_or_si256(va[2], vb[2]);
+    va[3] = _mm256_or_si256(va[3], vb[3]);
+}
+
+static inline __m256i swapBits256(__m256i v, __m256i mask, int shift) noexcept {
+    __m256i s = _mm256_srli_epi64(v, shift);
+    __m256i t = _mm256_and_si256(_mm256_xor_si256(s, v), mask);
+    return _mm256_xor_si256(_mm256_xor_si256(v, t), _mm256_slli_epi64(t, shift));
+}
+
+static inline void xorPermute1024AVX2(RowMask1024 &m, uint32_t x) noexcept {
+    __m256i v0 = _mm256_loadu_si256((__m256i*)&m.w[0]);
+    __m256i v1 = _mm256_loadu_si256((__m256i*)&m.w[4]);
+    __m256i v2 = _mm256_loadu_si256((__m256i*)&m.w[8]);
+    __m256i v3 = _mm256_loadu_si256((__m256i*)&m.w[12]);
+
+    if (x & 1u) {
+        __m256i mask = _mm256_set1_epi64x(0x5555555555555555ull);
+        v0 = swapBits256(v0, mask, 1); v1 = swapBits256(v1, mask, 1);
+        v2 = swapBits256(v2, mask, 1); v3 = swapBits256(v3, mask, 1);
     }
-    return false;
-}
-
-static inline void andMask(RowMask1024 &a, const RowMask1024 &b) noexcept {
-    for (int i = 0; i < 16; ++i) a.w[i] &= b.w[i];
-}
-
-static inline void orMask(RowMask1024 &a, const RowMask1024 &b) noexcept {
-    for (int i = 0; i < 16; ++i) a.w[i] |= b.w[i];
-}
-
-static inline uint64_t swapBits64(uint64_t x, uint64_t mask, unsigned shift) noexcept {
-    uint64_t t = ((x >> shift) ^ x) & mask;
-    return x ^ t ^ (t << shift);
-}
-
-static inline void swapWordBlocks(RowMask1024 &m, unsigned blockWords) noexcept {
-    const unsigned step = blockWords * 2u;
-    for (unsigned base = 0; base < 16; base += step) {
-        for (unsigned j = 0; j < blockWords; ++j) {
-            std::swap(m.w[base + j], m.w[base + blockWords + j]);
-        }
+    if (x & 2u) {
+        __m256i mask = _mm256_set1_epi64x(0x3333333333333333ull);
+        v0 = swapBits256(v0, mask, 2); v1 = swapBits256(v1, mask, 2);
+        v2 = swapBits256(v2, mask, 2); v3 = swapBits256(v3, mask, 2);
     }
+    if (x & 4u) {
+        __m256i mask = _mm256_set1_epi64x(0x0f0f0f0f0f0f0f0full);
+        v0 = swapBits256(v0, mask, 4); v1 = swapBits256(v1, mask, 4);
+        v2 = swapBits256(v2, mask, 4); v3 = swapBits256(v3, mask, 4);
+    }
+    if (x & 8u) {
+        __m256i mask = _mm256_set1_epi64x(0x00ff00ff00ff00ffull);
+        v0 = swapBits256(v0, mask, 8); v1 = swapBits256(v1, mask, 8);
+        v2 = swapBits256(v2, mask, 8); v3 = swapBits256(v3, mask, 8);
+    }
+    if (x & 16u) {
+        __m256i mask = _mm256_set1_epi64x(0x0000ffff0000ffffull);
+        v0 = swapBits256(v0, mask, 16); v1 = swapBits256(v1, mask, 16);
+        v2 = swapBits256(v2, mask, 16); v3 = swapBits256(v3, mask, 16);
+    }
+    if (x & 32u) {
+        __m256i mask = _mm256_set1_epi64x(0x00000000ffffffffull);
+        v0 = swapBits256(v0, mask, 32); v1 = swapBits256(v1, mask, 32);
+        v2 = swapBits256(v2, mask, 32); v3 = swapBits256(v3, mask, 32);
+    }
+
+    if (x & 64u) {
+        v0 = _mm256_permute4x64_epi64(v0, 0xB1); v1 = _mm256_permute4x64_epi64(v1, 0xB1);
+        v2 = _mm256_permute4x64_epi64(v2, 0xB1); v3 = _mm256_permute4x64_epi64(v3, 0xB1);
+    }
+    if (x & 128u) {
+        v0 = _mm256_permute4x64_epi64(v0, 0x4E); v1 = _mm256_permute4x64_epi64(v1, 0x4E);
+        v2 = _mm256_permute4x64_epi64(v2, 0x4E); v3 = _mm256_permute4x64_epi64(v3, 0x4E);
+    }
+    if (x & 256u) {
+        std::swap(v0, v1); std::swap(v2, v3);
+    }
+    if (x & 512u) {
+        std::swap(v0, v2); std::swap(v1, v3);
+    }
+
+    _mm256_storeu_si256((__m256i*)&m.w[0], v0);
+    _mm256_storeu_si256((__m256i*)&m.w[4], v1);
+    _mm256_storeu_si256((__m256i*)&m.w[8], v2);
+    _mm256_storeu_si256((__m256i*)&m.w[12], v3);
 }
 
-static inline void xorPermute1024(RowMask1024 &m, uint32_t x) noexcept {
-    if (x & 1u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x5555555555555555ull, 1);
-    if (x & 2u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x3333333333333333ull, 2);
-    if (x & 4u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x0f0f0f0f0f0f0f0full, 4);
-    if (x & 8u)  for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x00ff00ff00ff00ffull, 8);
-    if (x & 16u) for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x0000ffff0000ffffull, 16);
-    if (x & 32u) for (int i = 0; i < 16; ++i) m.w[i] = swapBits64(m.w[i], 0x00000000ffffffffull, 32);
-
-    if (x & 64u)  swapWordBlocks(m, 1);
-    if (x & 128u) swapWordBlocks(m, 2);
-    if (x & 256u) swapWordBlocks(m, 4);
-    if (x & 512u) swapWordBlocks(m, 8);
-}
-
-static inline RowMask1024 rotateRight1024(const RowMask1024 &in, unsigned r) noexcept {
-    RowMask1024 out{};
-    r &= 1023u;
-    unsigned wordShift = r >> 6;
-    unsigned bitShift = r & 63u;
-
-    if (bitShift == 0u) {
+static inline void rotateRight1024_opt_inplace(RowMask1024 &m, const ShiftParams &sp) noexcept {
+    if (sp.bitShift == 0u) {
+        if (sp.wordShift == 0u) return;
+        RowMask1024 out;
+        #pragma GCC unroll 16
         for (unsigned i = 0; i < 16; ++i) {
-            out.w[i] = in.w[(i + wordShift) & 15u];
+            out.w[i] = m.w[(i + sp.wordShift) & 15u];
         }
-        return out;
+        m = out;
+        return;
     }
-
-    unsigned bitShift2 = 64u - bitShift;
+    RowMask1024 out;
+    #pragma GCC unroll 16
     for (unsigned i = 0; i < 16; ++i) {
-        uint64_t a = in.w[(i + wordShift) & 15u];
-        uint64_t b = in.w[(i + wordShift + 1u) & 15u];
-        out.w[i] = (a >> bitShift) | (b << bitShift2);
+        uint64_t a = m.w[(i + sp.wordShift) & 15u];
+        uint64_t b = m.w[(i + sp.wordShift + 1u) & 15u];
+        out.w[i] = (a >> sp.bitShift) | (b << sp.bitShift2);
     }
-    return out;
+    m = out;
 }
 
 static inline RowMask1024 makePrefixMask1024(uint32_t bits) noexcept {
     RowMask1024 m{};
     if (bits == 0) return m;
-
     uint32_t fullWords = bits / 64u;
     uint32_t rem = bits % 64u;
-
-    for (uint32_t i = 0; i < fullWords; ++i) {
-        m.w[i] = ~0ull;
-    }
-    if (rem != 0u && fullWords < 16u) {
-        m.w[fullWords] = (1ull << rem) - 1ull;
-    }
+    for (uint32_t i = 0; i < fullWords; ++i) m.w[i] = ~0ull;
+    if (rem != 0u && fullWords < 16u) m.w[fullWords] = (1ull << rem) - 1ull;
     return m;
 }
 
@@ -352,130 +389,64 @@ static void initCarryMasks() {
     }
 }
 
-struct BucketTable24 {
-    static constexpr uint32_t BUCKET_SHIFT = MITM_LOW_BITS;   // 10
-    static constexpr uint32_t BUCKET_SIZE = MITM_HIGH_SIZE;    // 16384
-
-    array<uint32_t, BUCKET_SIZE> begin{};
-    array<uint32_t, BUCKET_SIZE> count{};
-    array<uint8_t, BUCKET_SIZE> present{};
-    vector<uint32_t> low24Keys;
-    vector<uint32_t> values;
-
-    inline pair<uint32_t, uint32_t> exactRange(uint32_t low24) const noexcept {
-        uint32_t bucket = low24 >> BUCKET_SHIFT;
-        if (!present[bucket]) return {0, 0};
-
-        uint32_t b = begin[bucket];
-        uint32_t e = b + count[bucket];
-
-        auto lb = lower_bound(low24Keys.begin() + b, low24Keys.begin() + e, low24);
-        auto ub = upper_bound(lb, low24Keys.begin() + e, low24);
-
-        return {
-            uint32_t(lb - low24Keys.begin()),
-            uint32_t(ub - low24Keys.begin())
-        };
-    }
-
-    inline bool contains(uint32_t value) const noexcept {
-        uint32_t low24 = value & LOWER_MASK;
-        auto [lb, ub] = exactRange(low24);
-        if (lb == ub) return false;
-        return binary_search(values.begin() + lb, values.begin() + ub, value);
-    }
-};
+// Fast Lookup Bitsets and Data Arrays
+static vector<uint64_t> swBitset;
+static vector<uint64_t> neBitset;
+static vector<uint64_t> nwBitset;
+static vector<uint32_t> seBucketStart;
+static vector<uint16_t> seBucketCount;
+static vector<uint32_t> seValuesFlat;
 
 static array<vector<uint32_t>, CORNER_COUNT> cornerSets;
-static array<BucketTable24, CORNER_COUNT> tables;
 static array<vector<RowMask1024>, CORNER_COUNT> cornerRows;
 
 static void buildCornerArtifacts(int corner) {
     auto &set = cornerSets[corner];
-    auto &tbl = tables[corner];
     auto &rows = cornerRows[corner];
-
     rows.assign(MITM_HIGH_SIZE, RowMask1024{});
 
-    vector<pair<uint32_t, uint32_t>> items;
-    items.reserve(set.size());
-
-    for (uint32_t v : set) {
-        items.emplace_back(v & LOWER_MASK, v);
-    }
-
-    sort(items.begin(), items.end(), [](const auto &a, const auto &b) {
-        if (a.first != b.first) return a.first < b.first;
-        return a.second < b.second;
+    vector<uint32_t> sortedByLow22 = set;
+    sort(sortedByLow22.begin(), sortedByLow22.end(), [](uint32_t a, uint32_t b) {
+        uint32_t lowA = a & LOWER_MASK;
+        uint32_t lowB = b & LOWER_MASK;
+        if (lowA != lowB) return lowA < lowB;
+        return a < b;
     });
 
-    uint32_t prevLow24 = UINT32_MAX;
-    for (const auto &it : items) {
-        uint32_t low24 = it.first;
-        if (low24 != prevLow24) {
-            uint32_t row = low24 >> MITM_LOW_BITS;
-            uint32_t bit = low24 & MITM_LOW_MASK;
+    uint32_t prevLow22 = UINT32_MAX;
+    for (uint32_t v : sortedByLow22) {
+        uint32_t low22 = v & LOWER_MASK;
+        if (low22 != prevLow22) {
+            uint32_t row = low22 >> MITM_LOW_BITS;
+            uint32_t bit = low22 & MITM_LOW_MASK;
             rows[row].w[bit >> 6] |= 1ull << (bit & 63u);
-            prevLow24 = low24;
+            prevLow22 = low22;
         }
     }
 
-    tbl.begin.fill(0);
-    tbl.count.fill(0);
-    tbl.present.fill(0);
-    tbl.low24Keys.clear();
-    tbl.values.clear();
-    tbl.low24Keys.reserve(items.size());
-    tbl.values.reserve(items.size());
-
-    size_t i = 0;
-    while (i < items.size()) {
-        uint32_t bucket = items[i].first >> BucketTable24::BUCKET_SHIFT;
-        tbl.present[bucket] = 1;
-        tbl.begin[bucket] = uint32_t(tbl.values.size());
-
-        size_t j = i;
-        while (j < items.size() && (items[j].first >> BucketTable24::BUCKET_SHIFT) == bucket) {
-            tbl.low24Keys.push_back(items[j].first);
-            tbl.values.push_back(items[j].second);
-            ++j;
+    if (corner == SW) {
+        swBitset.assign(TOTAL_UINT32 / 64, 0);
+        for (uint32_t v : set) swBitset[v >> 6] |= (1ULL << (v & 63u));
+    } else if (corner == NE) {
+        neBitset.assign(TOTAL_UINT32 / 64, 0);
+        for (uint32_t v : set) neBitset[v >> 6] |= (1ULL << (v & 63u));
+    } else if (corner == NW) {
+        nwBitset.assign(TOTAL_UINT32 / 64, 0);
+        for (uint32_t v : set) nwBitset[v >> 6] |= (1ULL << (v & 63u));
+    } else if (corner == SE) {
+        seBucketStart.assign(LOWER_SIZE, 0);
+        seBucketCount.assign(LOWER_SIZE, 0);
+        seValuesFlat = sortedByLow22; 
+        
+        for (size_t i = 0; i < seValuesFlat.size(); ) {
+            uint32_t low22 = seValuesFlat[i] & LOWER_MASK;
+            size_t j = i;
+            while (j < seValuesFlat.size() && (seValuesFlat[j] & LOWER_MASK) == low22) ++j;
+            seBucketStart[low22] = uint32_t(i);
+            seBucketCount[low22] = uint16_t(j - i);
+            i = j;
         }
-
-        tbl.count[bucket] = uint32_t(j - i);
-        i = j;
     }
-}
-
-static inline RowMask1024 buildCornerMask(
-    const RowMask1024 *rows,
-    uint32_t seedHigh14,
-    uint32_t seedLow10,
-    uint32_t uHigh14,
-    uint32_t deltaHigh14,
-    uint32_t deltaLow10
-) noexcept {
-    RowMask1024 out{};
-
-    uint32_t sum0 = (uHigh14 + deltaHigh14) & MITM_HIGH_MASK;
-    uint32_t row0 = seedHigh14 ^ sum0;
-
-    out = rows[row0];
-    xorPermute1024(out, seedLow10);
-    out = rotateRight1024(out, deltaLow10);
-    andMask(out, carryMask0[deltaLow10]);
-
-    if (deltaLow10 != 0u) {
-        uint32_t sum1 = (sum0 + 1u) & MITM_HIGH_MASK;
-        uint32_t row1 = seedHigh14 ^ sum1;
-
-        RowMask1024 extra = rows[row1];
-        xorPermute1024(extra, seedLow10);
-        extra = rotateRight1024(extra, deltaLow10);
-        andMask(extra, carryMask1[deltaLow10]);
-        orMask(out, extra);
-    }
-
-    return out;
 }
 
 int main(int argc, char **argv) {
@@ -557,7 +528,6 @@ int main(int argc, char **argv) {
         }
 
         baseStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
-
         lock_guard<mutex> guard(outputMutex);
         for (int corner = 0; corner < CORNER_COUNT; ++corner) {
             auto &globalList = validBases[corner];
@@ -600,116 +570,173 @@ int main(int argc, char **argv) {
 
     auto searchWorker = [&](unsigned tid) {
         uint64_t blockSize = (limitTotal + threadCount - 1) / threadCount;
-        uint64_t start = uint64_t(tid) * blockSize;
+        blockSize = (blockSize + 1023u) & ~1023ULL; 
+        uint64_t start = min(uint64_t(tid) * blockSize, limitTotal);
         uint64_t end = min(start + blockSize, limitTotal);
 
         uint64_t localProcessed = 0;
         BestSolution localBest{0, 0, 0, 0, 0, 0, UINT64_MAX};
+
+        // Preallocate masks securely on heap per thread to avoid stack overflows
+        auto pre_seRows = make_unique<RowMask1024[]>(MITM_HIGH_SIZE);
+        auto pre_swRows = make_unique<RowMask1024[]>(MITM_HIGH_SIZE);
+        auto pre_neRows = make_unique<RowMask1024[]>(MITM_HIGH_SIZE);
+        auto pre_nwRows = make_unique<RowMask1024[]>(MITM_HIGH_SIZE);
 
         const auto *seRows = cornerRows[SE].data();
         const auto *swRows = cornerRows[SW].data();
         const auto *neRows = cornerRows[NE].data();
         const auto *nwRows = cornerRows[NW].data();
 
-        const auto &seTbl = tables[SE];
-        const auto &swTbl = tables[SW];
-        const auto &neTbl = tables[NE];
-        const auto &nwTbl = tables[NW];
+        // Alter search order so seedLow10 (inner cycle mapping) acts as outer block
+        for (uint32_t sl10 = 0; sl10 < 1024; ++sl10) {
+            if (stopRequested.load(memory_order_relaxed)) break;
 
-        for (uint64_t value = start; value < end && !stopRequested.load(memory_order_relaxed); ++value) {
-            uint32_t seed = uint32_t(value);
-            auto feat = fastMakeFeatureSeed(seed);
+            for (uint32_t i = 0; i < MITM_HIGH_SIZE; ++i) {
+                pre_seRows[i] = seRows[i]; xorPermute1024AVX2(pre_seRows[i], sl10);
+                pre_swRows[i] = swRows[i]; xorPermute1024AVX2(pre_swRows[i], sl10);
+                pre_neRows[i] = neRows[i]; xorPermute1024AVX2(pre_neRows[i], sl10);
+                pre_nwRows[i] = nwRows[i]; xorPermute1024AVX2(pre_nwRows[i], sl10);
+            }
 
-            uint32_t xMul = feat.xMul;
-            uint32_t zMul = feat.zMul;
+            for (uint64_t base = start; base < end; base += 1024) {
+                if (stopRequested.load(memory_order_relaxed)) break;
+                uint64_t currentSeedVal = base + sl10;
+                if (currentSeedVal >= end) continue;
 
-            uint32_t seedLow24 = seed & LOWER_MASK;
-            uint32_t seedLow10 = seedLow24 & MITM_LOW_MASK;
-            uint32_t seedHigh14 = (seedLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+                uint32_t seed = uint32_t(currentSeedVal);
+                auto feat = fastMakeFeatureSeed(seed);
 
-            uint32_t xLow24 = xMul & LOWER_MASK;
-            uint32_t zLow24 = zMul & LOWER_MASK;
-            uint32_t xzLow24 = (xLow24 + zLow24) & LOWER_MASK;
+                uint32_t xMul = feat.xMul;
+                uint32_t zMul = feat.zMul;
 
-            uint32_t xLow10 = xLow24 & MITM_LOW_MASK;
-            uint32_t zLow10 = zLow24 & MITM_LOW_MASK;
-            uint32_t xzLow10 = xzLow24 & MITM_LOW_MASK;
+                uint32_t seedLow24 = seed & LOWER_MASK;
+                uint32_t seedHigh14 = (seedLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
 
-            uint32_t xHigh14 = (xLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
-            uint32_t zHigh14 = (zLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
-            uint32_t xzHigh14 = (xzLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+                uint32_t xLow24 = xMul & LOWER_MASK;
+                uint32_t zLow24 = zMul & LOWER_MASK;
+                uint32_t xzLow24 = (xLow24 + zLow24) & LOWER_MASK;
 
-            for (uint32_t uHigh14 = 0; uHigh14 < MITM_HIGH_SIZE && !stopRequested.load(memory_order_relaxed); ++uHigh14) {
-                RowMask1024 maskSE = buildCornerMask(seRows, seedHigh14, seedLow10, uHigh14, 0u, 0u);
-                if (!anyMask(maskSE)) continue;
+                uint32_t xLow10 = xLow24 & MITM_LOW_MASK;
+                uint32_t zLow10 = zLow24 & MITM_LOW_MASK;
+                uint32_t xzLow10 = xzLow24 & MITM_LOW_MASK;
 
-                RowMask1024 maskSW = buildCornerMask(swRows, seedHigh14, seedLow10, uHigh14, xHigh14, xLow10);
-                if (!anyMask(maskSW)) continue;
+                uint32_t xHigh14 = (xLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+                uint32_t zHigh14 = (zLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
+                uint32_t xzHigh14 = (xzLow24 >> MITM_LOW_BITS) & MITM_HIGH_MASK;
 
-                RowMask1024 maskNE = buildCornerMask(neRows, seedHigh14, seedLow10, uHigh14, zHigh14, zLow10);
-                if (!anyMask(maskNE)) continue;
+                auto getShiftParams = [](unsigned r) -> ShiftParams {
+                    r &= 1023u;
+                    return { r >> 6, r & 63u, 64u - (r & 63u) };
+                };
+                ShiftParams spSW = getShiftParams(xLow10);
+                ShiftParams spNE = getShiftParams(zLow10);
+                ShiftParams spNW = getShiftParams(xzLow10);
 
-                RowMask1024 maskNW = buildCornerMask(nwRows, seedHigh14, seedLow10, uHigh14, xzHigh14, xzLow10);
-                if (!anyMask(maskNW)) continue;
+                for (uint32_t row0 = 0; row0 < MITM_HIGH_SIZE; ++row0) {
+                    uint32_t uHigh14 = seedHigh14 ^ row0;
+                    RowMask1024 mask = pre_seRows[row0];
 
-                andMask(maskSE, maskSW);
-                if (!anyMask(maskSE)) continue;
+                    // Process SW exactly equivalent to before but in-lined to easily abort sequentially
+                    uint32_t sumSW = (uHigh14 + xHigh14) & MITM_HIGH_MASK;
+                    uint32_t rowSW = seedHigh14 ^ sumSW;
+                    RowMask1024 extraSW = pre_swRows[rowSW];
+                    rotateRight1024_opt_inplace(extraSW, spSW);
+                    andMask2(extraSW, carryMask0[xLow10]);
 
-                andMask(maskSE, maskNE);
-                if (!anyMask(maskSE)) continue;
+                    if (xLow10 != 0u) {
+                        uint32_t rowSW1 = seedHigh14 ^ ((sumSW + 1u) & MITM_HIGH_MASK);
+                        RowMask1024 extraSW1 = pre_swRows[rowSW1];
+                        rotateRight1024_opt_inplace(extraSW1, spSW);
+                        andMask2(extraSW1, carryMask1[xLow10]);
+                        orMask2(extraSW, extraSW1);
+                    }
+                    andMask2(mask, extraSW);
+                    if (!anyMask(mask)) continue;
 
-                andMask(maskSE, maskNW);
-                if (!anyMask(maskSE)) continue;
+                    // NE Phase
+                    uint32_t sumNE = (uHigh14 + zHigh14) & MITM_HIGH_MASK;
+                    uint32_t rowNE = seedHigh14 ^ sumNE;
+                    RowMask1024 extraNE = pre_neRows[rowNE];
+                    rotateRight1024_opt_inplace(extraNE, spNE);
+                    andMask2(extraNE, carryMask0[zLow10]);
 
-                for (int word = 0; word < 16; ++word) {
-                    uint64_t bits = maskSE.w[word];
-                    while (bits) {
-                        unsigned bit = unsigned(__builtin_ctzll(bits));
-                        bits &= (bits - 1);
+                    if (zLow10 != 0u) {
+                        uint32_t rowNE1 = seedHigh14 ^ ((sumNE + 1u) & MITM_HIGH_MASK);
+                        RowMask1024 extraNE1 = pre_neRows[rowNE1];
+                        rotateRight1024_opt_inplace(extraNE1, spNE);
+                        andMask2(extraNE1, carryMask1[zLow10]);
+                        orMask2(extraNE, extraNE1);
+                    }
+                    andMask2(mask, extraNE);
+                    if (!anyMask(mask)) continue;
 
-                        uint32_t uLow10 = uint32_t(word * 64 + bit);
-                        uint32_t u24 = (uHigh14 << MITM_LOW_BITS) | uLow10;
-                        uint32_t baseSELow24 = seedLow24 ^ u24;
+                    // NW Phase
+                    uint32_t sumNW = (uHigh14 + xzHigh14) & MITM_HIGH_MASK;
+                    uint32_t rowNW = seedHigh14 ^ sumNW;
+                    RowMask1024 extraNW = pre_nwRows[rowNW];
+                    rotateRight1024_opt_inplace(extraNW, spNW);
+                    andMask2(extraNW, carryMask0[xzLow10]);
 
-                        auto [lb, ub] = seTbl.exactRange(baseSELow24);
-                        if (lb == ub) continue;
+                    if (xzLow10 != 0u) {
+                        uint32_t rowNW1 = seedHigh14 ^ ((sumNW + 1u) & MITM_HIGH_MASK);
+                        RowMask1024 extraNW1 = pre_nwRows[rowNW1];
+                        rotateRight1024_opt_inplace(extraNW1, spNW);
+                        andMask2(extraNW1, carryMask1[xzLow10]);
+                        orMask2(extraNW, extraNW1);
+                    }
+                    andMask2(mask, extraNW);
+                    if (!anyMask(mask)) continue;
 
-                        for (uint32_t idx = lb; idx < ub; ++idx) {
-                            if ((idx & 1023u) == 0u && stopRequested.load(memory_order_relaxed)) {
-                                break;
-                            }
+                    for (int word = 0; word < 16; ++word) {
+                        uint64_t bits = mask.w[word];
+                        while (bits) {
+                            unsigned bit = unsigned(__builtin_ctzll(bits));
+                            bits &= (bits - 1);
 
-                            uint32_t baseSE = seTbl.values[idx];
-                            uint32_t cSE = seed ^ baseSE;
+                            uint32_t uLow10 = uint32_t(word * 64 + bit);
+                            uint32_t u24 = (uHigh14 << MITM_LOW_BITS) | uLow10;
+                            uint32_t baseSELow24 = seedLow24 ^ u24;
+                            
+                            uint32_t startIdx = seBucketStart[baseSELow24];
+                            uint32_t count = seBucketCount[baseSELow24];
 
-                            uint32_t baseSW = seed ^ (cSE + xMul);
-                            uint32_t baseNE = seed ^ (cSE + zMul);
-                            uint32_t baseNW = seed ^ (cSE + xMul + zMul);
+                            for (uint32_t i = 0; i < count; ++i) {
+                                if ((i & 1023u) == 0u && stopRequested.load(memory_order_relaxed)) break;
 
-                            if (!swTbl.contains(baseSW)) continue;
-                            if (!neTbl.contains(baseNE)) continue;
-                            if (!nwTbl.contains(baseNW)) continue;
+                                uint32_t baseSE = seValuesFlat[startIdx + i];
+                                uint32_t cSE = seed ^ baseSE;
 
-                            candidateCount.fetch_add(1, memory_order_relaxed);
-                            foundCount.fetch_add(1, memory_order_relaxed);
+                                uint32_t baseSW = seed ^ (cSE + xMul);
+                                if (!((swBitset[baseSW >> 6] >> (baseSW & 63)) & 1)) continue;
 
-                            uint32_t baseO = cSE;
-                            BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
-                            if (solution.distance < localBest.distance) {
-                                localBest = solution;
+                                uint32_t baseNE = seed ^ (cSE + zMul);
+                                if (!((neBitset[baseNE >> 6] >> (baseNE & 63)) & 1)) continue;
+
+                                uint32_t baseNW = seed ^ (cSE + xMul + zMul);
+                                if (!((nwBitset[baseNW >> 6] >> (baseNW & 63)) & 1)) continue;
+
+                                candidateCount.fetch_add(1, memory_order_relaxed);
+                                foundCount.fetch_add(1, memory_order_relaxed);
+
+                                uint32_t baseO = cSE;
+                                BestSolution solution = nearestSolution(seed, xMul, zMul, baseO);
+                                if (solution.distance < localBest.distance) {
+                                    localBest = solution;
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            ++localProcessed;
-            if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
-                searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
-                localProcessed = 0;
+                ++localProcessed;
+                if ((localProcessed & (FLUSH_INTERVAL - 1)) == 0) {
+                    searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
+                    localProcessed = 0;
+                }
             }
         }
-
+        
         searchStatus.processed.fetch_add(localProcessed, memory_order_relaxed);
 
         if (localBest.distance < UINT64_MAX) {
