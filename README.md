@@ -122,7 +122,7 @@ These enable aggressive optimizations, target the specific host CPU, employ link
 
 We transformed an infeasible 2^80 brute‑force search into a practical ~2^38 scan by:
 
-- Precomputing the lottery over all 2^32 region seeds, removing the RNG overhead.
+- Precomputing the region seeds over all 2^32 region seeds, removing the RNG overhead.
 - Using a 12‑high / 10‑low MITM split to reduce per‑seed work from scanning all U to 1024 fast mask intersections.
 - Handling carries with precomputed shift masks.
 - Accelerating all 4096‑bit mask operations with AVX2 SIMD intrinsics.
